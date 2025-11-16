@@ -12,6 +12,9 @@
 (define-constant err-proposal-not-ended (err u108))
 (define-constant err-proposal-failed (err u109))
 (define-constant err-no-revenue (err u110))
+(define-constant err-vesting-not-found (err u111))
+(define-constant err-no-tokens-to-claim (err u112))
+(define-constant err-invalid-vesting-params (err u113))
 
 (define-data-var total-employees uint u0)
 (define-data-var total-productivity uint u0)
@@ -43,6 +46,14 @@
 
 (define-map votes {proposal-id: uint, voter: principal} bool)
 
+(define-map vesting-schedules principal {
+    total-amount: uint,
+    claimed-amount: uint,
+    start-block: uint,
+    cliff-block: uint,
+    end-block: uint
+})
+
 (define-read-only (get-employee (employee principal))
     (map-get? employees employee)
 )
@@ -73,6 +84,35 @@
 
 (define-read-only (get-total-employees)
     (ok (var-get total-employees))
+)
+
+(define-read-only (get-vesting-schedule (employee principal))
+    (map-get? vesting-schedules employee)
+)
+
+(define-read-only (calculate-vested-tokens (employee principal))
+    (let (
+        (vesting (unwrap! (map-get? vesting-schedules employee) (err u0)))
+        (total (get total-amount vesting))
+        (claimed (get claimed-amount vesting))
+        (start (get start-block vesting))
+        (cliff (get cliff-block vesting))
+        (end-block (get end-block vesting))
+        (current-block stacks-block-height)
+    )
+    (if (< current-block cliff)
+        (ok u0)
+        (if (>= current-block end-block)
+            (ok (- total claimed))
+            (let (
+                (elapsed (- current-block start))
+                (duration (- end-block start))
+                (vested (/ (* total elapsed) duration))
+            )
+                (ok (- vested claimed))
+            )
+        )
+    ))
 )
 
 (define-read-only (calculate-revenue-share (employee principal))
@@ -241,5 +281,42 @@
         (asserts! (> new-min u0) err-invalid-amount)
         (var-set min-proposal-tokens new-min)
         (ok true)
+    )
+)
+
+(define-public (create-vesting-schedule (employee principal) (amount uint) (cliff-duration uint) (vesting-duration uint))
+    (let (
+        (employee-data (unwrap! (map-get? employees employee) err-not-employee))
+        (start stacks-block-height)
+        (cliff (+ start cliff-duration))
+        (end-block (+ start vesting-duration))
+    )
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (get is-active employee-data) err-not-employee)
+        (asserts! (> amount u0) err-invalid-amount)
+        (asserts! (> vesting-duration cliff-duration) err-invalid-vesting-params)
+        (try! (ft-mint? dao-token amount tx-sender))
+        (map-set vesting-schedules employee {
+            total-amount: amount,
+            claimed-amount: u0,
+            start-block: start,
+            cliff-block: cliff,
+            end-block: end-block
+        })
+        (ok true)
+    )
+)
+
+(define-public (claim-vested-tokens)
+    (let (
+        (vesting (unwrap! (map-get? vesting-schedules tx-sender) err-vesting-not-found))
+        (claimable (unwrap! (calculate-vested-tokens tx-sender) err-no-tokens-to-claim))
+    )
+        (asserts! (> claimable u0) err-no-tokens-to-claim)
+        (map-set vesting-schedules tx-sender (merge vesting {
+            claimed-amount: (+ (get claimed-amount vesting) claimable)
+        }))
+        (try! (ft-transfer? dao-token claimable contract-owner tx-sender))
+        (ok claimable)
     )
 )
